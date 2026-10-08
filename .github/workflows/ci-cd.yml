@@ -1,0 +1,86 @@
+# CI/CD for the Wistia video analytics pipeline
+#   CI (every push and pull request): code compiles, JSON files are valid
+#   CD (push to main only, after CI passes): deploy to AWS with the OIDC role (no stored keys)
+#      1. Lambda wistia-ingest  <- ingestion/wistia_client.py + requests (zip)
+#      2. Glue scripts          <- transform/silver_clean.py, transform/gold_build.py  (s3://.../scripts/)
+#      3. Step Functions        <- orchestration/state_machine.json
+
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:          # "Run workflow" button in the Actions tab
+
+env:
+  AWS_REGION: us-east-1
+  BUCKET: wistia-data-222238779166
+  LAMBDA_NAME: wistia-ingest
+  STATE_MACHINE_ARN: arn:aws:states:us-east-1:222238779166:stateMachine:wistia-pipeline
+  DEPLOY_ROLE_ARN: arn:aws:iam::222238779166:role/wistia-github-deploy-role
+
+jobs:
+  ci:
+    name: CI - checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Python files compile
+        run: python -m py_compile ingestion/wistia_client.py transform/silver_clean.py transform/gold_build.py
+
+      - name: JSON files are valid
+        run: |
+          for f in orchestration/*.json iam/*.json; do
+            python -m json.tool "$f" > /dev/null && echo "OK  $f"
+          done
+
+  cd:
+    name: CD - deploy to AWS
+    needs: ci                                   # only if CI passed
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write                           # lets GitHub get the OIDC token for AWS
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Log in to AWS (OIDC role, short-lived credentials)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build the Lambda zip (Linux runner = Linux libraries)
+        run: |
+          mkdir build
+          pip install requests -t build
+          cp ingestion/wistia_client.py build/
+          cd build && zip -qr ../wistia_lambda.zip .
+
+      - name: Deploy Lambda code
+        run: |
+          aws lambda update-function-code --function-name "$LAMBDA_NAME" --zip-file fileb://wistia_lambda.zip > /dev/null
+          aws lambda wait function-updated --function-name "$LAMBDA_NAME"
+          echo "Lambda $LAMBDA_NAME updated"
+
+      - name: Deploy Glue scripts
+        run: |
+          aws s3 cp transform/silver_clean.py "s3://$BUCKET/scripts/silver_clean.py"
+          aws s3 cp transform/gold_build.py   "s3://$BUCKET/scripts/gold_build.py"
+
+      - name: Deploy Step Functions definition
+        run: |
+          aws stepfunctions update-state-machine --state-machine-arn "$STATE_MACHINE_ARN" --definition file://orchestration/state_machine.json > /dev/null
+          echo "State machine updated"

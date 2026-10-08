@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DeployLambdaCode",
+      "Effect": "Allow",
+      "Action": ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration"],
+      "Resource": "arn:aws:lambda:us-east-1:222238779166:function:wistia-ingest"
+    },
+    {
+      "Sid": "DeployGlueScripts",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::wistia-data-222238779166/scripts/silver_clean.py",
+        "arn:aws:s3:::wistia-data-222238779166/scripts/gold_build.py"
+      ]
+    },
+    {
+      "Sid": "DeployStateMachine",
+      "Effect": "Allow",
+      "Action": ["states:UpdateStateMachine", "states:DescribeStateMachine"],
+      "Resource": "arn:aws:states:us-east-1:222238779166:stateMachine:wistia-pipeline"
+    }
+  ]
+}
