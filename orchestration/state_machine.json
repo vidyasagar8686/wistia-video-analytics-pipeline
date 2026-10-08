@@ -1,0 +1,47 @@
+{
+  "Comment": "Wistia daily pipeline: ingest -> silver -> gold -> crawler; email alert on any failure",
+  "StartAt": "Ingest",
+  "States": {
+    "Ingest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "wistia-ingest", "Payload": {} },
+      "Retry": [ { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                   "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "SilverClean"
+    },
+    "SilverClean": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "wistia-silver-clean" },
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "GoldBuild"
+    },
+    "GoldBuild": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "wistia-gold-build" },
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "RefreshCatalog"
+    },
+    "RefreshCatalog": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": { "Name": "wistia-gold-crawler" },
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:222238779166:wistia-pipeline-alerts",
+        "Subject": "Wistia pipeline FAILED",
+        "Message.$": "States.Format('Wistia pipeline failed. Execution: {}. Error: {}', $$.Execution.Id, States.JsonToString($.error))"
+      },
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": { "Type": "Fail", "Error": "PipelineFailed", "Cause": "A step failed; see the alert email and the execution history." }
+  }
+}

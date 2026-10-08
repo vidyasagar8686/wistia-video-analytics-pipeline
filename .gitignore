@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Build output (recreated by the deploy)
+build/
+*.zip
+
+# Local data and Spark files (data lives in S3)
+data/
+samples/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Logs and local notes
+backfill_log.txt
+*.log
+
+# Secrets (never commit)
+.env
+*.pem
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
