@@ -1,173 +1,82 @@
 # Wistia Video Analytics Pipeline
 
-A daily, fully automated data pipeline on **AWS** that collects video engagement data from the **Wistia Stats API** for two marketing videos (Facebook and YouTube), cleans it with **PySpark**, models it as a **star schema**, and makes it queryable with **SQL in Amazon Athena**.
+A small daily AWS ETL project: Wistia API → S3 Bronze → Glue PySpark Silver →
+Gold star schema → Athena. The two videos have assumed Facebook/YouTube labels;
+the API does not establish referral channel attribution.
 
-| | |
-|---|---|
-| Cloud | AWS (us-east-1) |
-| Ingestion | Python (`requests`) in AWS Lambda, incremental with watermarks |
-| Transformation | PySpark on AWS Glue 5.0 (Spark 3.5): Bronze → Silver → Gold |
-| Data model | Star schema: `dim_media`, `dim_visitor`, `fact_media_daily`, `fact_media_engagement` |
-| Query layer | Glue Data Catalog + Amazon Athena |
-| Orchestration | EventBridge Scheduler (daily 6:00 AM Central) → Step Functions; SNS email on failure |
-| CI/CD | GitHub Actions with AWS OIDC (no stored keys) |
+## Review changes
 
----
+This branch adds source fixes and tests. It does not establish deployment or
+production compliance. Read [release migration](docs/release_migration.md) before
+enabling CD: output paths, query database selection and runtime permissions change.
 
-## Architecture
-
-```mermaid
-flowchart LR
-    API[Wistia Stats API<br/>media, daily stats,<br/>events, visitors]
-
-    subgraph AWS
-        SCH[EventBridge Scheduler<br/>daily 06:00 CT]
-        SFN[Step Functions<br/>wistia-pipeline]
-        L[Lambda<br/>wistia-ingest]
-        SM[(Secrets Manager<br/>API token)]
-        DDB[(DynamoDB<br/>watermarks)]
-        B[(S3 Bronze<br/>raw JSON)]
-        G1[Glue job<br/>wistia-silver-clean]
-        S[(S3 Silver<br/>clean Parquet)]
-        G2[Glue job<br/>wistia-gold-build]
-        GO[(S3 Gold<br/>star schema)]
-        CR[Glue crawler<br/>+ Data Catalog]
-        ATH[Athena<br/>SQL]
-        SNS[SNS<br/>failure email]
-    end
-
-    GH[GitHub Actions<br/>CI/CD via OIDC]
-
-    SCH --> SFN
-    SFN --> L --> G1 --> G2 --> CR
-    API --> L
-    SM --> L
-    DDB <--> L
-    L --> B --> G1 --> S --> G2 --> GO --> CR --> ATH
-    SFN -. any step fails .-> SNS
-    GH -. deploys code .-> L
-    GH -. deploys scripts .-> G1
-    GH -. deploys definition .-> SFN
-```
-
-**Daily flow:** the scheduler starts the state machine → Lambda pulls only **new** data from the API into Bronze → Glue cleans it into Silver → Glue builds the Gold star schema and runs reconciliation checks → the crawler refreshes the Athena tables. If any step fails, an email alert is sent.
-
----
-
-## Repository layout
-
-```
-.github/workflows/ci-cd.yml        CI (checks) + CD (deploy to AWS) on push to main
-ingestion/wistia_client.py         Lambda: API → S3 Bronze (pagination, retries, watermarks)
-transform/silver_clean.py          Glue job: Bronze → Silver (types, dedupe, privacy)
-transform/gold_build.py            Glue job: Silver → Gold (star schema + reconciliation checks)
-transform/explore_bronze.py        Exploration notebook-style script used during development
-orchestration/state_machine.json   Step Functions definition (with failure alert)
-iam/                               OIDC trust + deploy policy for GitHub Actions
-sql/athena_queries.sql             Business and data-quality queries
-docs/                              Design document, runbook, demo script
-requirements.txt                   Python packages for local development
-```
-
----
-
-## Data model (Gold)
-
-```mermaid
-erDiagram
-    dim_media ||--o{ fact_media_daily : "media_id"
-    dim_media ||--o{ fact_media_engagement : "media_id"
-    dim_visitor ||--o{ fact_media_engagement : "visitor_id"
-
-    dim_media {
-        string media_id PK
-        string title
-        timestamp created_at
-        string url
-        double duration_seconds
-        timestamp updated_at
-        string channel "Facebook / YouTube (assumption)"
-    }
-    dim_visitor {
-        string visitor_id PK
-        string ip_masked "last octet XXX"
-        string country
-        string region
-        string city
-        timestamp created_at
-        timestamp last_active_at
-        bigint load_count
-        bigint play_count
-        string browser
-        string platform
-        boolean is_mobile
-    }
-    fact_media_daily {
-        string media_id FK
-        date date
-        bigint load_count
-        bigint play_count
-        double hours_watched
-        double play_rate "plays / loads"
-    }
-    fact_media_engagement {
-        string media_id FK
-        string visitor_id FK
-        date date
-        bigint play_count
-        double watched_percent
-        double total_watch_time "seconds"
-    }
-```
-
-| Table | Grain | Rows (2026-10-08) |
+| Concern | Source change | Remaining boundary |
 |---|---|---|
-| `dim_media` (SCD1) | one video | 2 |
-| `dim_visitor` (SCD1) | one visitor who played our videos | 1,158 |
-| `fact_media_daily` | video × day | 1,490 |
-| `fact_media_engagement` | video × visitor × day | 1,170 |
+| Filename attribution | Explicit request metadata; validated legacy fallback; reject conflicts | Video IDs remain a configured two-video list |
+| Concurrent progress | Consistent reads and compare-and-swap watermarks; unique raw filenames | No claim of lossless capture under arbitrary source edits or late arrival |
+| Partial extraction | Cap exhaustion fails, logs and blocks progress for that batch | Operator-managed backfill retries from the prior watermark |
+| Publication | Validate, stage immutable outputs, register one versioned database, conditionally switch release manifest | Readers must pin the manifest database; old saved queries require migration |
+| Privacy | IPv4/IPv6 network masking and suppressed-visitor registry | Retention approval, reader audit and operational erasure still required |
+| Testing and operations | Behavioral/Spark tests; selected schema contracts; additive IAM/alarm template | Full infrastructure provisioning and live alarm tests remain |
+| Metric agreement | Versioned project definitions and matching-window SQL | Wistia UI formula and stakeholder sign-off are unresolved |
 
-Two fact tables because **loads** (needed for play rate) exist only per video per day, while **plays and watched %** exist per visitor.
+## Execution flow
 
----
+EventBridge starts Step Functions at 6 AM America/Chicago. Ingestion reads five
+endpoints, saves raw responses and advances completed-source watermarks
+conditionally. A cap, source failure or conflict prevents downstream processing
+through the workflow's SNS failure path.
 
-## Results (as of 2026-10-08)
+Silver writes an isolated `silver_versions/<run_id>/` snapshot. Gold reads that
+same version, checks reconciliation and references, writes
+`gold_versions/<run_id>/`, verifies row counts and registers its four tables.
+A conditional write to `releases/current.json` makes that database the release.
+The old crawler is removed from the new workflow.
 
-| Channel | Loads | Plays | Play rate | Viewers | Avg watched | Hours watched |
-|---|---|---|---|---|---|---|
-| YouTube | 915 | 320 | **35.0%** | 280 | **25.8%** | **51.2** |
-| Facebook | 118,459 | 944 | **0.8%** | 880 | **14.1%** | 35.8 |
+Athena consumers resolve the manifest once per report and query its database.
+The legacy `wistia_gold` database does not switch automatically. Failed candidate
+databases are not releases and should not be exposed as reporting datasets.
 
-- Facebook reaches ~130× more screens but < 1% of viewers press play, and they watch ~14% of the video (typical autoplay-in-feed behaviour).
-- YouTube reaches few people, but 1 in 3 watch, and they watch ~26% → **more total watch time with one third of the plays**.
-- **Reconciliation:** average watched % matches Wistia's own dashboard engagement (25.6% / 14.4%); daily plays match lifetime plays within < 3% (daily stats end at the last complete day).
+## Data model
 
----
+| Table | Grain | Metrics or attributes |
+|---|---|---|
+| dim_media | Video | Current metadata and assumed channel |
+| dim_visitor | Visitor in selected-video events | Latest location, coarse IP network and browser attributes |
+| fact_media_daily | Video and UTC day | Loads, plays, hours watched, project play rate |
+| fact_media_engagement | Video, visitor and UTC day | Play count, average watched fraction, estimated watch seconds |
 
-## How to run
+Both dimensions use current attributes. Historical location analysis should use
+event detail; current video duration is used to estimate watch seconds.
 
-**Automatic:** nothing to do. The pipeline runs every day at 6:00 AM Central. Check Step Functions → `wistia-pipeline` → Executions.
+## Tests
 
-**Manual run:** Step Functions → `wistia-pipeline` → **Start execution** (input `{}`).
+Use Python 3.11 and Java 11 for the synthetic Spark tests:
 
-**Query:** Athena → workgroup `wistia-workgroup` → database `wistia_gold` → run queries from `sql/athena_queries.sql`.
-
-**Develop locally** (Windows, Python 3.11, Java 11):
+```text
+pip install boto3 requests pyspark==3.5.3
+python -m unittest discover -s tests -v
 ```
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-aws s3 sync s3://wistia-data-222238779166/bronze/ data\bronze\
-python transform\silver_clean.py
-python transform\gold_build.py
-```
 
-**Deploy a change:** commit and push to `main`. GitHub Actions checks the code, then updates the Lambda, the Glue scripts and the state machine.
+Set RUN_SPARK_TESTS=1 to include real Spark subprocesses. Unit tests use mocked
+AWS clients; Spark tests use synthetic local files, not production credentials.
+CI sets this variable and runs the full suite. All runtime JSON is syntax-checked.
+Tests cover capped paging, equal timestamps, failures, stale watermark writes,
+IP masking, registry validation and conditional catalog publication. The Spark
+test covers deduplication, suppressed visitors, envelope/legacy attribution,
+successful publication and keeping the prior release after invalid attribution.
 
----
+## Deployment and open decisions
 
-## Documentation
+[Release migration](docs/release_migration.md) describes the required permission,
+catalog, registry and query changes. Deployment is disabled until repository
+variable WISTIA_RELEASE_DEPLOY_ENABLED is explicitly set to true. The code still
+uses existing Lambda/Glue resources; [the additive template](infra/hardening.json)
+is not a complete recreation of the environment.
 
-- [Design document](docs/design_doc.md): requirements mapping, decisions, assumptions, trade-offs, data quality
-- [Runbook](docs/runbook.md): every build step and command, troubleshooting, operations, teardown
-- [Demo script](docs/demo_script.md): walkthrough for the demo video
+- [Privacy lifecycle procedure](privacy/README.md)
+- [Metric definitions and reconciliation](docs/metrics.md)
+- [Metric reconciliation SQL](sql/metric_reconciliation.sql)
+- [Original design record](docs/design_doc.md)
+- [Original build runbook](docs/runbook.md)
+
