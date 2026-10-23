@@ -17,6 +17,7 @@ enabling CD: output paths, query database selection and runtime permissions chan
 | Partial extraction | Cap exhaustion fails, logs and blocks progress for that batch | Operator-managed backfill retries from the prior watermark |
 | Publication | Validate, stage immutable outputs, register one versioned database, conditionally switch release manifest | Readers must pin the manifest database; old saved queries require migration |
 | Privacy | IPv4/IPv6 network masking and suppressed-visitor registry | Retention approval, reader audit and operational erasure still required |
+| Deduplication | Validate keys before grouping, collapse exact canonical copies, reject unresolved conflicts | Snapshot ordering is not a guarantee of capturing all source edits |
 | Testing and operations | Behavioral/Spark tests; selected schema contracts; additive IAM/alarm template | Full infrastructure provisioning and live alarm tests remain |
 | Metric agreement | Versioned project definitions and matching-window SQL | Wistia UI formula and stakeholder sign-off are unresolved |
 
@@ -76,6 +77,7 @@ is not a complete recreation of the environment.
 
 - [Privacy lifecycle procedure](privacy/README.md)
 - [Metric definitions and reconciliation](docs/metrics.md)
+- [Business keys and duplicate conflict policy](docs/deduplication.md)
 - [Metric reconciliation SQL](sql/metric_reconciliation.sql)
 - [Original design record](docs/design_doc.md)
 - [Original build runbook](docs/runbook.md)
