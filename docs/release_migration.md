@@ -24,6 +24,12 @@ this guide takes precedence for the changed paths and behavior.
   `releases/current.json`. Existing release locations are not overwritten.
 - CI runs unit and synthetic Spark integration tests. Glue bookmarks are not used:
   each run fully rebuilds an isolated version, appropriate for this volume.
+- Key checks run before deduplication. Exact canonical copies collapse; conflicting
+  events and conflicting latest snapshot ties fail instead of selecting a hash
+  winner. Media orders by source updated, profiles by last_active_at, and daily
+  rows by observation time with a legacy collection-day fallback. See
+  docs/deduplication.md before processing existing history: the stricter contract
+  can expose previously hidden source conflicts.
 
 ## Migration checklist
 
