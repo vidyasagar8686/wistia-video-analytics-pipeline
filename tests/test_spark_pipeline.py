@@ -38,6 +38,9 @@ class SparkPipelineTests(unittest.TestCase):
                  "user_agent_details": profile}
         erased = {**event, "event_key": "erased-event", "visitor_key": "erased-visitor"}
         self.write(root, "events", "events.json", [event, event, erased])
+        replay = root / "bronze/events/load_date=2026-10-02"
+        replay.mkdir(parents=True)
+        (replay / "different_raw_filename.json").write_text(json.dumps([event]))
         privacy = root / "privacy"
         privacy.mkdir()
         (privacy / "suppressed_visitors.json").write_text(json.dumps({"visitor_keys": ["erased-visitor"]}))
