@@ -1,5 +1,5 @@
 {
-  "Comment": "Wistia daily pipeline: ingest -> silver -> gold -> crawler; email alert on any failure",
+  "Comment": "Wistia daily pipeline: complete ingestion -> isolated Silver -> validated versioned Gold release; SNS on failure",
   "StartAt": "Ingest",
   "States": {
     "Ingest": {
@@ -14,21 +14,21 @@
     "SilverClean": {
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
-      "Parameters": { "JobName": "wistia-silver-clean" },
+      "Parameters": { "JobName": "wistia-silver-clean", "Arguments": {
+        "--run_id.$": "$$.Execution.Name",
+        "--extra-py-files": "s3://wistia-data-222238779166/scripts/pipeline_support.py"
+      } },
       "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
       "Next": "GoldBuild"
     },
     "GoldBuild": {
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
-      "Parameters": { "JobName": "wistia-gold-build" },
-      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
-      "Next": "RefreshCatalog"
-    },
-    "RefreshCatalog": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
-      "Parameters": { "Name": "wistia-gold-crawler" },
+      "Parameters": { "JobName": "wistia-gold-build", "Arguments": {
+        "--run_id.$": "$$.Execution.Name",
+        "--release_started_at.$": "$$.Execution.StartTime",
+        "--extra-py-files": "s3://wistia-data-222238779166/scripts/pipeline_support.py"
+      } },
       "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
       "End": true
     },

@@ -1,0 +1,8 @@
+{
+  "ID": "WistiaRawRetentionOwnerApprovalRequired",
+  "Status": "Disabled",
+  "Filter": {"Prefix": "bronze/"},
+  "Expiration": {"Days": 365},
+  "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
+  "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
+}

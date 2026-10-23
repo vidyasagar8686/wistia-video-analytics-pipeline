@@ -1,0 +1,89 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Add permissions and monitoring to existing Wistia resources; review before deployment",
+  "Parameters": {
+    "BucketName": {"Type": "String"},
+    "GlueRoleName": {"Type": "String"},
+    "IngestFunctionName": {"Type": "String", "Default": "wistia-ingest"},
+    "StateMachineArn": {"Type": "String"},
+    "AlertTopicArn": {"Type": "String"}
+  },
+  "Resources": {
+    "VersionedReleaseAccess": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "wistia-versioned-release-access",
+        "Roles": [{"Ref": "GlueRoleName"}],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}"}},
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": [
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/bronze/*"},
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/scripts/*"},
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/privacy/suppressed_visitors.json"}
+            ]},
+            {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], "Resource": [
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/silver_versions/*"},
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/gold_versions/*"},
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/releases/current.json"},
+              {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/*_$folder$"}
+            ]},
+            {"Effect": "Allow", "Action": ["glue:CreateDatabase", "glue:GetDatabase", "glue:CreateTable", "glue:GetTable"], "Resource": [
+              {"Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"},
+              {"Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/wistia_gold_v_*"},
+              {"Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/wistia_gold_v_*/*"}
+            ]}
+          ]
+        }
+      }
+    },
+    "IncompleteExtractionMetric": {
+      "Type": "AWS::Logs::MetricFilter",
+      "Properties": {
+        "LogGroupName": {"Fn::Sub": "/aws/lambda/${IngestFunctionName}"},
+        "FilterPattern": "\"extraction_incomplete\"",
+        "MetricTransformations": [{"MetricNamespace": "Wistia/Pipeline", "MetricName": "IncompleteExtraction", "MetricValue": "1", "DefaultValue": 0}]
+      }
+    },
+    "IncompleteExtractionAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "Wistia/Pipeline", "MetricName": "IncompleteExtraction",
+        "Statistic": "Sum", "Period": 300, "EvaluationPeriods": 1,
+        "Threshold": 1, "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching", "AlarmActions": [{"Ref": "AlertTopicArn"}]
+      }
+    },
+    "ExecutionFailureAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/States", "MetricName": "ExecutionsFailed",
+        "Dimensions": [{"Name": "StateMachineArn", "Value": {"Ref": "StateMachineArn"}}],
+        "Statistic": "Sum", "Period": 300, "EvaluationPeriods": 1,
+        "Threshold": 1, "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching", "AlarmActions": [{"Ref": "AlertTopicArn"}]
+      }
+    },
+    "ExecutionDurationAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/States", "MetricName": "ExecutionTime",
+        "Dimensions": [{"Name": "StateMachineArn", "Value": {"Ref": "StateMachineArn"}}],
+        "Statistic": "Maximum", "Period": 300, "EvaluationPeriods": 1,
+        "Threshold": 600000, "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching", "AlarmActions": [{"Ref": "AlertTopicArn"}]
+      }
+    },
+    "MissingDailySuccessAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/States", "MetricName": "ExecutionsSucceeded",
+        "Dimensions": [{"Name": "StateMachineArn", "Value": {"Ref": "StateMachineArn"}}],
+        "Statistic": "Sum", "Period": 86400, "EvaluationPeriods": 1,
+        "Threshold": 1, "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching", "AlarmActions": [{"Ref": "AlertTopicArn"}]
+      }
+    }
+  }
+}
