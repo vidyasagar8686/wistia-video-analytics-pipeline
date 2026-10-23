@@ -24,6 +24,9 @@ env:
 jobs:
   ci:
     name: CI - checks
+    concurrency:
+      group: wistia-ci-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
