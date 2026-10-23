@@ -26,7 +26,8 @@ class SparkPipelineTests(unittest.TestCase):
                 "duration": 60.0})
             daily_row = {"date": "2026-09-30", "load_count": 10, "play_count": 1, "hours_watched": 0.01}
             daily_payload = {
-                "ingestion": {"media_id": video, "completed": True},
+                "ingestion": {"media_id": video, "completed": True,
+                              "collected_at": "2026-10-01T08:00:00Z"},
                 "data": [daily_row]}
             self.write(root, "daily_stats", f"renamed_{i}.json" if i == 0 else video + "_123456.json",
                        daily_payload if i == 0 else [daily_row])
@@ -49,7 +50,7 @@ class SparkPipelineTests(unittest.TestCase):
         import pyspark
         env = {**os.environ, "SPARK_LOCAL_IP": "127.0.0.1",
                "SPARK_HOME": str(Path(pyspark.__file__).parent),
-               "PYSPARK_SUBMIT_ARGS": "--master local[2] --conf spark.sql.shuffle.partitions=4 pyspark-shell"}
+               "PYSPARK_SUBMIT_ARGS": "--master local[2] --conf spark.sql.shuffle.partitions=4 --conf spark.ui.showConsoleProgress=false pyspark-shell"}
         result = subprocess.run([sys.executable, str(ROOT / "transform" / script),
                                  "--base_path", str(root), "--run_id", run_id],
                                 cwd=ROOT, env=env,
@@ -70,6 +71,24 @@ class SparkPipelineTests(unittest.TestCase):
             pointer = root / "releases/current.json"
             first = pointer.read_text()
             self.assertEqual(json.loads(first)["run_id"], "valid")
+            # Null profile IDs used to survive deduplication. Fail the source batch
+            # before grouping and leave the accepted release untouched.
+            visitors_file = root / "bronze/visitors/load_date=2026-10-01/visitors.json"
+            profiles = json.loads(visitors_file.read_text())
+            visitors_file.write_text(json.dumps(profiles + [{**profiles[0], "visitor_key": None}]))
+            invalid_key = self.run_job("silver_clean.py", root, "invalid_key", success=False)
+            self.assertIn("business key visitor_key", invalid_key.stderr)
+            self.assertEqual(pointer.read_text(), first)
+            visitors_file.write_text(json.dumps(profiles))
+            # Same event identity, different analytical payload: load_date or a
+            # hash must not silently pick a version that changes watch metrics.
+            events_file = root / "bronze/events/load_date=2026-10-01/events.json"
+            events = json.loads(events_file.read_text())
+            events_file.write_text(json.dumps(events + [{**events[0], "percent_viewed": 0.9}]))
+            conflict = self.run_job("silver_clean.py", root, "conflicting_event", success=False)
+            self.assertIn("conflicting copies", conflict.stderr)
+            self.assertEqual(pointer.read_text(), first)
+            events_file.write_text(json.dumps(events))
             # A Gold-only validation failure must not publish or overwrite a release.
             metadata_file = root / "bronze/media/load_date=2026-10-01/8hunphufxp.json"
             metadata = json.loads(metadata_file.read_text())
