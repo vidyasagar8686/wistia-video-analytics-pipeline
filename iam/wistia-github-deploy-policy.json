@@ -13,7 +13,8 @@
       "Action": "s3:PutObject",
       "Resource": [
         "arn:aws:s3:::wistia-data-222238779166/scripts/silver_clean.py",
-        "arn:aws:s3:::wistia-data-222238779166/scripts/gold_build.py"
+        "arn:aws:s3:::wistia-data-222238779166/scripts/gold_build.py",
+        "arn:aws:s3:::wistia-data-222238779166/scripts/pipeline_support.py"
       ]
     },
     {
