@@ -30,21 +30,36 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Install test dependencies
+        run: pip install boto3 requests pyspark==3.5.3
+
+      - name: Behavioral and Spark integration tests
+        env:
+          RUN_SPARK_TESTS: "1"
+          SPARK_LOCAL_IP: "127.0.0.1"
+        run: python -m unittest discover -s tests -v
 
       - name: Python files compile
-        run: python -m py_compile ingestion/wistia_client.py transform/silver_clean.py transform/gold_build.py
+        run: python -m compileall -q ingestion transform privacy tests
 
       - name: JSON files are valid
         run: |
-          for f in orchestration/*.json iam/*.json; do
+          for f in orchestration/*.json iam/*.json infra/*.json privacy/*.json; do
             python -m json.tool "$f" > /dev/null && echo "OK  $f"
           done
 
   cd:
     name: CD - deploy to AWS
     needs: ci                                   # only if CI passed
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Deployment is explicitly enabled after migration permissions are installed.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.WISTIA_RELEASE_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write                           # lets GitHub get the OIDC token for AWS
@@ -79,8 +94,10 @@ jobs:
         run: |
           aws s3 cp transform/silver_clean.py "s3://$BUCKET/scripts/silver_clean.py"
           aws s3 cp transform/gold_build.py   "s3://$BUCKET/scripts/gold_build.py"
+          aws s3 cp transform/pipeline_support.py "s3://$BUCKET/scripts/pipeline_support.py"
 
       - name: Deploy Step Functions definition
         run: |
           aws stepfunctions update-state-machine --state-machine-arn "$STATE_MACHINE_ARN" --definition file://orchestration/state_machine.json > /dev/null
           echo "State machine updated"
+
