@@ -18,6 +18,9 @@ How a run works:
     - freshness        : newest day in fact_media_daily is at most --max_lag_days old (default 1)
     - no shrinking     : no Gold table has fewer rows than the version currently published
 
+  Audit: every run appends one row per table (Silver and Gold, with quarantine counts) to
+  the Iceberg table <gold_db>.pipeline_audit, status "ok" or "failed" with the reason.
+
   Gold table               Grain (one row per)
   dim_media      (SCD1)    video
   dim_visitor    (SCD1)    visitor who played our videos
@@ -55,12 +58,14 @@ WAREHOUSE = get_arg("iceberg_warehouse", f"{BASE_PATH}/gold_iceberg_test/")
 SILVER = f"{BASE_PATH}/silver"
 CATALOG = "glue_catalog"
 MAX_LAG_DAYS = int(get_arg("max_lag_days", "1"))
+JOB_RUN_ID = get_arg("JOB_RUN_ID", "manual")        # Glue passes --JOB_RUN_ID automatically
+RUN_TIME = datetime.now(timezone.utc)
 
 # ---------------------------------------------------------------------
 # Spark setup with the Iceberg catalog (Glue Data Catalog)
 # ---------------------------------------------------------------------
 spark = (SparkSession.builder
-    .appName("wistia_gold_build_iceberg")
+    .appName("wistia_gold_build")
     .config("spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
@@ -143,20 +148,64 @@ for name, df in gold_tables.items():
 
 
 # =====================================================================
+# AUDIT - one row per table per run, appended to <gold_db>.pipeline_audit (Iceberg)
+# =====================================================================
+AUDIT_TABLE = f"{CATALOG}.{GOLD_DB}.pipeline_audit"
+
+
+def count_or_none(path):
+    try:
+        return spark.read.parquet(path).count()
+    except Exception:
+        return None
+
+
+def write_audit(status, message=""):
+    """Best effort: an audit problem is logged but never hides the real result of the run."""
+    rows = []
+    for t in ["media", "events", "visitors", "daily_stats"]:
+        rows.append(("silver", t, count_or_none(f"{SILVER}/{t}"),
+                     count_or_none(f"{BASE_PATH}/quarantine/{t}") if t != "media" else None))
+    for name, df in gold_tables.items():
+        rows.append(("gold", name, df.count(), None))
+    audit = spark.createDataFrame(
+        [(RUN_TIME, JOB_RUN_ID, layer, table, n, q, status, message) for layer, table, n, q in rows],
+        "run_time timestamp, job_run_id string, layer string, table_name string, "
+        "row_count long, quarantined_rows long, status string, message string")
+    try:
+        try:
+            spark.table(AUDIT_TABLE)
+            audit.writeTo(AUDIT_TABLE).append()
+        except Exception as missing:
+            if "not found" not in str(missing).lower() and "cannot be found" not in str(missing).lower():
+                raise
+            audit.writeTo(AUDIT_TABLE).using("iceberg").tableProperty("format-version", "2").create()
+        print(f"audit: {len(rows)} rows written to {AUDIT_TABLE} (status {status})")
+    except Exception as error:
+        print(f"audit: WARNING could not write audit rows: {error}")
+
+
+def fail(message):
+    """Record the failed run in the audit table, then stop the job (Gold is not changed)."""
+    write_audit("failed", message)
+    raise RuntimeError(message)
+
+
+# =====================================================================
 # PART 2 - CHECK before writing (any failure stops the job; Gold is not touched)
 # =====================================================================
 total_plays = gold_tables["fact_media_engagement"].agg(F.sum("play_count")).collect()[0][0]
 silver_plays = silver_events.count()
 print(f"check: plays in fact = {total_plays}, events in silver = {silver_plays}")
 if total_plays != silver_plays:
-    raise RuntimeError(f"Reconciliation failed: {total_plays} plays in fact vs {silver_plays} events. "
+    fail(f"Reconciliation failed: {total_plays} plays in fact vs {silver_plays} events. "
                        f"Gold was NOT changed.")
 
 missing_visitors = (gold_tables["fact_media_engagement"]
     .join(gold_tables["dim_visitor"], on="visitor_id", how="left_anti").count())
 print(f"check: fact visitors missing from dim_visitor = {missing_visitors}")
 if missing_visitors > 0:
-    raise RuntimeError(f"Referential integrity failed: {missing_visitors} visitors missing from "
+    fail(f"Referential integrity failed: {missing_visitors} visitors missing from "
                        f"dim_visitor. Gold was NOT changed.")
 
 # Freshness: the newest day must be recent, otherwise Gold would silently show old data
@@ -165,7 +214,7 @@ latest_day = gold_tables["fact_media_daily"].agg(F.max("date")).collect()[0][0]
 lag_days = (today_utc - latest_day).days if latest_day is not None else None
 print(f"check: newest day in fact_media_daily = {latest_day}, {lag_days} day(s) before today (max {MAX_LAG_DAYS})")
 if lag_days is None or lag_days > MAX_LAG_DAYS:
-    raise RuntimeError(f"Freshness failed: newest day is {latest_day}, more than {MAX_LAG_DAYS} day(s) "
+    fail(f"Freshness failed: newest day is {latest_day}, more than {MAX_LAG_DAYS} day(s) "
                        f"before {today_utc}. Gold was NOT changed.")
 
 # No shrinking: a full rebuild from all of Silver should never have fewer rows than the
@@ -180,7 +229,7 @@ for name, df in gold_tables.items():
     new_rows = df.count()
     print(f"check: {name:<22} new rows = {new_rows}, published rows = {current_rows}")
     if new_rows < current_rows:
-        raise RuntimeError(f"Row count dropped for {name}: {new_rows} new vs {current_rows} published. "
+        fail(f"Row count dropped for {name}: {new_rows} new vs {current_rows} published. "
                            f"Gold was NOT changed.")
 
 print("all checks passed - writing Gold")
@@ -197,6 +246,7 @@ for name, df in gold_tables.items():
        .createOrReplace())
     print(f"gold {target:<45} committed")
 
+write_audit("ok")
 print("gold build finished successfully")
 
 spark.stop()
