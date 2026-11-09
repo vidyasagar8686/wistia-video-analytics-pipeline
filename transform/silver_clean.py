@@ -150,7 +150,11 @@ daily = daily.withColumn("date", F.to_date("date"))      # text -> date
 daily = daily.withColumn(
     "media_id", F.regexp_extract(F.input_file_name(), r"([a-z0-9]{10})(_\d+)?\.json$", 1)
 )
-daily = keep_latest(daily, ["media_id", "date"], "load_date")   # one row per video per day
+# One row per video per day. The ingestion lookback loads recent days again, so keep the
+# NEWEST copy: order by load_date, then by file name (it ends with the run time HHMMSS),
+# so a later run on the same day wins.
+daily = daily.withColumn("load_order", F.concat_ws("|", F.col("load_date").cast("string"), F.input_file_name()))
+daily = keep_latest(daily, ["media_id", "date"], "load_order")
 
 silver_daily = daily.select("media_id", "date", "load_count", "play_count", "hours_watched")
 save_silver(silver_daily, "daily_stats")
