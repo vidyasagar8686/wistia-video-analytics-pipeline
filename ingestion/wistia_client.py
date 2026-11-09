@@ -16,6 +16,10 @@ BUCKET = "wistia-data-222238779166"
 MAX_PAGES = 50
 # Visitors: Wistia returns 504 Gateway Timeout for 100 per page (tested Nov 9, 2026); 50 returns in ~2 s
 VISITORS_PER_PAGE = 50
+# Non-critical endpoints: if only these fail, the run returns "partial" and Silver/Gold still run.
+# visitors only adds browser info to dim_visitor; media_stats is not used by Silver yet.
+# Critical (metadata, daily_stats, events) failures still fail the run.
+NON_CRITICAL = ("stats", "visitors")
 
 
 # ---------- Token ----------
@@ -223,17 +227,24 @@ def run():
             set_watermark("visitors", visitors[0]["last_active_at"])
         log.info(f"new visitors: {len(visitors)}")
 
-    if failures:
-        log.error(f"run finished with failures: {failures}")
+    critical = [f for f in failures if f.split(" ")[-1] not in NON_CRITICAL]   # e.g. "8hunphufxp stats" -> "stats"
+    if critical:
+        log.error(f"run finished with critical failures: {failures}")
         raise RuntimeError(f"failed: {failures}")
+    if failures:
+        # Watermarks of the failed endpoints were not moved, so the next run catches up
+        log.warning(f"run finished with non-critical failures (pipeline continues): {failures}")
+        return {"status": "partial", "failed": failures}
     log.info("run finished")
+    return {"status": "ok", "failed": []}
 
 
 # ---------- Entry points ----------
 def lambda_handler(event, context):
     # AWS Lambda calls this function
-    run()
-    return {"status": "ok"}
+    # Returns {"status": "ok" | "partial", "failed": [...]}; Step Functions reads it.
+    # A critical failure raises an error instead, so the whole pipeline stops.
+    return run()
 
 
 if __name__ == "__main__":
