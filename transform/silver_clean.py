@@ -33,6 +33,7 @@ if "--base_path" in sys.argv:
     BASE_PATH = sys.argv[sys.argv.index("--base_path") + 1]
 BRONZE = f"{BASE_PATH}/bronze"
 SILVER = f"{BASE_PATH}/silver"
+QUARANTINE = f"{BASE_PATH}/quarantine"
 
 # ---------------------------------------------------------------------
 # Spark setup
@@ -55,6 +56,21 @@ def keep_latest(df, keys, order_col):
     SQL: ROW_NUMBER() OVER (PARTITION BY keys ORDER BY order_col DESC) ... WHERE rn = 1"""
     w = Window.partitionBy(*keys).orderBy(F.col(order_col).desc())
     return df.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1).drop("rn")
+
+
+def split_quarantine(df, table, rules):
+    """Data quality rules. rules = [(condition_that_means_BAD, reason), ...].
+    Bad rows go to quarantine/<table> with a dq_reason column (first rule that failed);
+    only good rows are returned for Silver. Quarantine is rebuilt every run (overwrite),
+    so it always shows the bad rows that are in Bronze right now."""
+    reason = F.lit(None).cast("string")
+    for condition, text in reversed(rules):
+        reason = F.when(F.coalesce(condition, F.lit(False)), F.lit(text)).otherwise(reason)
+    df = df.withColumn("dq_reason", reason)
+    bad = df.filter(F.col("dq_reason").isNotNull())
+    bad.write.mode("overwrite").parquet(f"{QUARANTINE}/{table}")
+    print(f"quarantine {table:<8} rows: {bad.count():>7}")
+    return df.filter(F.col("dq_reason").isNull()).drop("dq_reason")
 
 
 def save_silver(df, table):
@@ -109,6 +125,11 @@ silver_events = events.select(
     F.col("user_agent_details.mobile").alias("is_mobile"),
 ).replace("", None)                                      # empty text -> NULL
 
+silver_events = split_quarantine(silver_events, "events", [
+    (F.col("event_key").isNull(), "event_key missing"),
+    (F.col("media_id").isNull(), "media_id missing"),
+    ((F.col("percent_viewed") < 0) | (F.col("percent_viewed") > 1), "percent_viewed out of range"),
+])
 save_silver(silver_events, "events")
 
 
@@ -135,6 +156,9 @@ silver_visitors = visitors.select(
     F.col("user_agent_details.mobile").alias("is_mobile"),
 ).replace("", None)
 
+silver_visitors = split_quarantine(silver_visitors, "visitors", [
+    (F.col("visitor_key").isNull(), "visitor_key missing"),
+])
 save_silver(silver_visitors, "visitors")
 
 
@@ -157,6 +181,10 @@ daily = daily.withColumn("load_order", F.concat_ws("|", F.col("load_date").cast(
 daily = keep_latest(daily, ["media_id", "date"], "load_order")
 
 silver_daily = daily.select("media_id", "date", "load_count", "play_count", "hours_watched")
+silver_daily = split_quarantine(silver_daily, "daily_stats", [
+    ((F.col("media_id").isNull()) | (F.col("media_id") == ""), "media_id not found in file name"),
+    ((F.col("play_count") < 0) | (F.col("load_count") < 0), "negative play or load count"),
+])
 save_silver(silver_daily, "daily_stats")
 
 
