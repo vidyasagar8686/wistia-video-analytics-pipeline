@@ -1,47 +1,67 @@
 """
-gold_build.py  -  Silver -> Gold (star schema)
-Wistia Video Analytics Pipeline (PySpark)
+gold_build_iceberg.py  -  Silver -> Gold (star schema) as Apache Iceberg tables
+Wistia Video Analytics Pipeline (PySpark on AWS Glue 5.0)
 
-Reads the Silver tables, applies the business rules, and saves the star schema to Gold as Parquet.
-Always reads from Silver (never from Bronze). Full rebuild each run (overwrite).
+Same business logic as gold_build.py. What is different:
+  1. All 4 Gold tables are BUILT first and kept in memory (nothing is written yet).
+  2. The reconciliation checks run BEFORE any write. If a check fails, the job stops
+     and the Gold tables stay exactly as they were (last good version).
+  3. Each table is written as an Iceberg table in the Glue Data Catalog with
+     createOrReplace(): an atomic commit, so Athena readers see either the old
+     version or the new one, never a half-written table. Older versions stay
+     available for rollback (Iceberg time travel).
+  4. No crawler is needed: Iceberg registers and updates the tables in the catalog itself.
 
-  Gold table               Grain (one row per)          Built from                         Rows (2026-10-07)
-  dim_media      (SCD1)    video                        silver/media + channel rule                2
-  dim_visitor    (SCD1)    visitor who played our videos silver/events (latest location)
-                                                         + silver/visitors (browser info)     1,158
-  fact_media_daily         video x day                  silver/daily_stats + play_rate         1,490
-  fact_media_engagement    video x visitor x day        silver/events aggregated
-                                                         + dim_media duration                  1,170
+  Gold table               Grain (one row per)
+  dim_media      (SCD1)    video
+  dim_visitor    (SCD1)    visitor who played our videos
+  fact_media_daily         video x day
+  fact_media_engagement    video x visitor x day
 
-Run on the laptop:   python transform\\gold_build.py   (after silver_clean.py)
-In AWS Glue later:   change BASE_PATH to "s3://wistia-data-222238779166"
+Glue job parameters:
+  --base_path            s3://wistia-data-222238779166
+  --gold_db              wistia_gold_test   (test)   or   wistia_gold   (production)
+  --iceberg_warehouse    s3://wistia-data-222238779166/gold_iceberg_test/   (used only if the
+                         database has no location of its own)
+  --datalake-formats     iceberg
 """
 
-import os
 import sys
-
-if os.name == "nt":                                  # Windows laptop only; Glue runs on Linux
-    os.environ["PYSPARK_PYTHON"] = sys.executable
 
 from pyspark.sql import SparkSession, Window, functions as F
 
-# ---------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------
-# Laptop: "data". Glue passes --base_path s3://wistia-data-222238779166 as a job parameter.
-BASE_PATH = "data"
-if "--base_path" in sys.argv:
-    BASE_PATH = sys.argv[sys.argv.index("--base_path") + 1]
-SILVER = f"{BASE_PATH}/silver"
-GOLD = f"{BASE_PATH}/gold"
 
 # ---------------------------------------------------------------------
-# Spark setup
+# Settings (from Glue job parameters)
 # ---------------------------------------------------------------------
-# spark = SparkSession.builder.master("local[*]").appName("wistia_gold_build").getOrCreate()
-spark = SparkSession.builder.appName("wistia_gold_build").getOrCreate()
+def get_arg(name, default):
+    flag = f"--{name}"
+    if flag in sys.argv:
+        return sys.argv[sys.argv.index(flag) + 1]
+    return default
+
+
+BASE_PATH = get_arg("base_path", "s3://wistia-data-222238779166")
+GOLD_DB = get_arg("gold_db", "wistia_gold_test")                 # safe default = test
+WAREHOUSE = get_arg("iceberg_warehouse", f"{BASE_PATH}/gold_iceberg_test/")
+SILVER = f"{BASE_PATH}/silver"
+CATALOG = "glue_catalog"
+
+# ---------------------------------------------------------------------
+# Spark setup with the Iceberg catalog (Glue Data Catalog)
+# ---------------------------------------------------------------------
+spark = (SparkSession.builder
+    .appName("wistia_gold_build_iceberg")
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
+    .config(f"spark.sql.catalog.{CATALOG}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config(f"spark.sql.catalog.{CATALOG}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config(f"spark.sql.catalog.{CATALOG}.warehouse", WAREHOUSE)
+    .getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
 spark.conf.set("spark.sql.session.timeZone", "UTC")
+print(f"gold database: {GOLD_DB}   silver: {SILVER}")
 
 
 def read_silver(table):
@@ -49,32 +69,21 @@ def read_silver(table):
     return spark.read.parquet(f"{SILVER}/{table}")
 
 
-def save_gold(df, table):
-    """Save a Gold table (full rebuild each run) and print its row count."""
-    df.write.mode("overwrite").parquet(f"{GOLD}/{table}")
-    print(f"gold {table:<22} saved: {df.count():>6}")
-
-
 # =====================================================================
+# PART 1 - BUILD all 4 tables (business logic unchanged; nothing written yet)
+# =====================================================================
+
 # 1. dim_media  (SCD1: current values only)
-#    Business rule: channel per video (Wistia has no channel field).
 #    ASSUMPTION for SME approval: vertical 8hunphufxp = Facebook, horizontal 9k4tbcdfg0 = YouTube.
-#    SQL: CASE WHEN media_id = '8hunphufxp' THEN 'Facebook' WHEN ... ELSE 'Unknown' END
-# =====================================================================
 dim_media = read_silver("media").withColumn(
     "channel",
     F.when(F.col("media_id") == "8hunphufxp", "Facebook")
      .when(F.col("media_id") == "9k4tbcdfg0", "YouTube")
      .otherwise("Unknown"),
 )
-save_gold(dim_media, "dim_media")
 
-
-# =====================================================================
 # 2. fact_media_daily  (one row per video per day)
-#    Business rule: play_rate = plays / loads (0 when there were no loads).
-#    Loads exist only per video per day, so play_rate lives in this fact.
-# =====================================================================
+#    play_rate = plays / loads (0 when there were no loads)
 fact_media_daily = read_silver("daily_stats").withColumn(
     "play_rate",
     F.round(
@@ -82,44 +91,27 @@ fact_media_daily = read_silver("daily_stats").withColumn(
         4,
     ),
 )
-save_gold(fact_media_daily, "fact_media_daily")
 
-
-# =====================================================================
 # 3. dim_visitor  (SCD1, one row per visitor who played our videos)
-#    Business rule: a visitor's location = the location of their MOST RECENT play.
-#    Built from events (not from the account-wide visitors list), so every visitor
-#    in fact_media_engagement is guaranteed to exist here (referential integrity).
-# =====================================================================
+#    location = location of the visitor's MOST RECENT play
 silver_events = read_silver("events")
 
-# Latest play per visitor  (SQL: ROW_NUMBER() OVER (PARTITION BY visitor_key ORDER BY event_at DESC) = 1)
 w_loc = Window.partitionBy("visitor_key").orderBy(F.col("event_at").desc())
 latest_location = (silver_events
     .withColumn("rn", F.row_number().over(w_loc))
     .filter(F.col("rn") == 1)
     .select("visitor_key", "ip_masked", "country", "region", "city")
 )
-
-# Add browser info from the visitors list  (SQL: LEFT JOIN silver_visitors ON visitor_key)
 dim_visitor = (latest_location
     .join(read_silver("visitors"), on="visitor_key", how="left")
-    .withColumnRenamed("visitor_key", "visitor_id")          # brief's name
+    .withColumnRenamed("visitor_key", "visitor_id")
 )
-save_gold(dim_visitor, "dim_visitor")
 
-
-# =====================================================================
-# 4. fact_media_engagement  (aggregated: one row per video x visitor x day)
-#    play_count       = COUNT(*)                               number of plays
-#    watched_percent  = AVG(percent_viewed)                    average share of the video watched
-#    total_watch_time = SUM(percent_viewed * duration_seconds) seconds watched
-# =====================================================================
+# 4. fact_media_engagement  (one row per video x visitor x day)
 plays = (silver_events
-    .withColumn("date", F.to_date("event_at"))                              # day of the play
+    .withColumn("date", F.to_date("event_at"))
     .join(dim_media.select("media_id", "duration_seconds"), on="media_id", how="left")
 )
-
 fact_media_engagement = (plays
     .groupBy("media_id", "visitor_key", "date")
     .agg(
@@ -129,22 +121,48 @@ fact_media_engagement = (plays
     )
     .withColumnRenamed("visitor_key", "visitor_id")
 )
-save_gold(fact_media_engagement, "fact_media_engagement")
+
+# Keep the built tables in memory, so the checks and the writes use the same data
+gold_tables = {
+    "dim_media": dim_media.cache(),
+    "fact_media_daily": fact_media_daily.cache(),
+    "dim_visitor": dim_visitor.cache(),
+    "fact_media_engagement": fact_media_engagement.cache(),
+}
+for name, df in gold_tables.items():
+    print(f"built {name:<22} rows: {df.count():>6}")
 
 
 # =====================================================================
-# 5. Reconciliation checks (the run fails if any check fails)
+# PART 2 - CHECK before writing (any failure stops the job; Gold is not touched)
 # =====================================================================
-total_plays = fact_media_engagement.agg(F.sum("play_count")).collect()[0][0]
+total_plays = gold_tables["fact_media_engagement"].agg(F.sum("play_count")).collect()[0][0]
 silver_plays = silver_events.count()
 print(f"check: plays in fact = {total_plays}, events in silver = {silver_plays}")
 if total_plays != silver_plays:
-    raise RuntimeError(f"Reconciliation failed: {total_plays} plays in fact vs {silver_plays} events")
+    raise RuntimeError(f"Reconciliation failed: {total_plays} plays in fact vs {silver_plays} events. "
+                       f"Gold was NOT changed.")
 
-missing_visitors = fact_media_engagement.join(dim_visitor, on="visitor_id", how="left_anti").count()
+missing_visitors = (gold_tables["fact_media_engagement"]
+    .join(gold_tables["dim_visitor"], on="visitor_id", how="left_anti").count())
 print(f"check: fact visitors missing from dim_visitor = {missing_visitors}")
 if missing_visitors > 0:
-    raise RuntimeError(f"Referential integrity failed: {missing_visitors} visitors missing from dim_visitor")
+    raise RuntimeError(f"Referential integrity failed: {missing_visitors} visitors missing from "
+                       f"dim_visitor. Gold was NOT changed.")
+
+print("all checks passed - writing Gold")
+
+
+# =====================================================================
+# PART 3 - WRITE each table as Iceberg (atomic commit per table)
+# =====================================================================
+for name, df in gold_tables.items():
+    target = f"{CATALOG}.{GOLD_DB}.{name}"
+    (df.writeTo(target)
+       .using("iceberg")
+       .tableProperty("format-version", "2")
+       .createOrReplace())
+    print(f"gold {target:<45} committed")
 
 print("gold build finished successfully")
 
