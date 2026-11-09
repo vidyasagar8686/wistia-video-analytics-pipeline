@@ -14,6 +14,8 @@ BASE_URL = "https://api.wistia.com/v1"
 MEDIA_IDS = ["8hunphufxp", "9k4tbcdfg0"]
 BUCKET = "wistia-data-222238779166"
 MAX_PAGES = 50
+# Visitors: Wistia returns 504 Gateway Timeout for 100 per page (tested Nov 9, 2026); 50 returns in ~2 s
+VISITORS_PER_PAGE = 50
 
 
 # ---------- Token ----------
@@ -72,7 +74,7 @@ def get_visitors_page(token, page, per_page):
     return call_wistia(token, url)
 
 
-def get_all_visitors(token, per_page=100, max_pages=MAX_PAGES, since=None):
+def get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, since=None):
     all_visitors = []
     page = 1
     stop = False
@@ -211,7 +213,7 @@ def run():
 
     last_visitor = get_watermark("visitors")
     log.info(f"visitors since: {last_visitor}")
-    visitors = get_all_visitors(token, per_page=100, max_pages=MAX_PAGES, since=last_visitor)
+    visitors = get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, since=last_visitor)
     if visitors is None:
         log.error("visitors failed, bookmark not moved")
         failures.append("visitors")
