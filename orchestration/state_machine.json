@@ -1,5 +1,5 @@
 {
-  "Comment": "Wistia daily pipeline: ingest -> silver -> gold -> crawler; email alert on any failure",
+  "Comment": "Wistia daily pipeline: ingest -> silver -> gold (Iceberg tables register themselves in the catalog); email alert on any failure",
   "StartAt": "Ingest",
   "States": {
     "Ingest": {
@@ -22,13 +22,6 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": { "JobName": "wistia-gold-build" },
-      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
-      "Next": "RefreshCatalog"
-    },
-    "RefreshCatalog": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
-      "Parameters": { "Name": "wistia-gold-crawler" },
       "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
       "End": true
     },
