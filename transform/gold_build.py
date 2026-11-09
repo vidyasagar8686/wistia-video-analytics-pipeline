@@ -1,8 +1,8 @@
 """
-gold_build_iceberg.py  -  Silver -> Gold (star schema) as Apache Iceberg tables
+gold_build.py  -  Silver -> Gold (star schema) as Apache Iceberg tables
 Wistia Video Analytics Pipeline (PySpark on AWS Glue 5.0)
 
-Same business logic as gold_build.py. What is different:
+How a run works:
   1. All 4 Gold tables are BUILT first and kept in memory (nothing is written yet).
   2. The reconciliation checks run BEFORE any write. If a check fails, the job stops
      and the Gold tables stay exactly as they were (last good version).
@@ -11,6 +11,12 @@ Same business logic as gold_build.py. What is different:
      version or the new one, never a half-written table. Older versions stay
      available for rollback (Iceberg time travel).
   4. No crawler is needed: Iceberg registers and updates the tables in the catalog itself.
+
+  Checks run before any write (a failure stops the job; Gold keeps its last good version):
+    - reconciliation   : plays in fact_media_engagement = events in Silver
+    - integrity        : every visitor in the fact exists in dim_visitor
+    - freshness        : newest day in fact_media_daily is at most --max_lag_days old (default 1)
+    - no shrinking     : no Gold table has fewer rows than the version currently published
 
   Gold table               Grain (one row per)
   dim_media      (SCD1)    video
@@ -24,9 +30,11 @@ Glue job parameters:
   --iceberg_warehouse    s3://wistia-data-222238779166/gold_iceberg_test/   (used only if the
                          database has no location of its own)
   --datalake-formats     iceberg
+  --max_lag_days         1   (optional; newest day allowed to be this many days before today, UTC)
 """
 
 import sys
+from datetime import datetime, timezone
 
 from pyspark.sql import SparkSession, Window, functions as F
 
@@ -46,6 +54,7 @@ GOLD_DB = get_arg("gold_db", "wistia_gold_test")                 # safe default 
 WAREHOUSE = get_arg("iceberg_warehouse", f"{BASE_PATH}/gold_iceberg_test/")
 SILVER = f"{BASE_PATH}/silver"
 CATALOG = "glue_catalog"
+MAX_LAG_DAYS = int(get_arg("max_lag_days", "1"))
 
 # ---------------------------------------------------------------------
 # Spark setup with the Iceberg catalog (Glue Data Catalog)
@@ -149,6 +158,30 @@ print(f"check: fact visitors missing from dim_visitor = {missing_visitors}")
 if missing_visitors > 0:
     raise RuntimeError(f"Referential integrity failed: {missing_visitors} visitors missing from "
                        f"dim_visitor. Gold was NOT changed.")
+
+# Freshness: the newest day must be recent, otherwise Gold would silently show old data
+today_utc = datetime.now(timezone.utc).date()
+latest_day = gold_tables["fact_media_daily"].agg(F.max("date")).collect()[0][0]
+lag_days = (today_utc - latest_day).days if latest_day is not None else None
+print(f"check: newest day in fact_media_daily = {latest_day}, {lag_days} day(s) before today (max {MAX_LAG_DAYS})")
+if lag_days is None or lag_days > MAX_LAG_DAYS:
+    raise RuntimeError(f"Freshness failed: newest day is {latest_day}, more than {MAX_LAG_DAYS} day(s) "
+                       f"before {today_utc}. Gold was NOT changed.")
+
+# No shrinking: a full rebuild from all of Silver should never have fewer rows than the
+# version that is published now (first run: the table does not exist yet, so it is skipped)
+for name, df in gold_tables.items():
+    target = f"{CATALOG}.{GOLD_DB}.{name}"
+    try:
+        current_rows = spark.table(target).count()
+    except Exception:
+        print(f"check: {name:<22} no published version yet - skipped")
+        continue
+    new_rows = df.count()
+    print(f"check: {name:<22} new rows = {new_rows}, published rows = {current_rows}")
+    if new_rows < current_rows:
+        raise RuntimeError(f"Row count dropped for {name}: {new_rows} new vs {current_rows} published. "
+                           f"Gold was NOT changed.")
 
 print("all checks passed - writing Gold")
 
