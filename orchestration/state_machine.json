@@ -1,5 +1,5 @@
 {
-  "Comment": "Wistia daily pipeline: ingest -> silver -> gold (Iceberg tables register themselves in the catalog); email alert on any failure",
+  "Comment": "Wistia daily pipeline: ingest -> silver -> gold (Iceberg tables register themselves in the catalog); email alert on failure; warning email when only a non-critical endpoint failed",
   "StartAt": "Ingest",
   "States": {
     "Ingest": {
@@ -8,7 +8,26 @@
       "Parameters": { "FunctionName": "wistia-ingest", "Payload": {} },
       "Retry": [ { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
                    "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 } ],
+      "ResultSelector": { "status.$": "$.Payload.status", "failed.$": "$.Payload.failed" },
+      "ResultPath": "$.ingest",
       "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" } ],
+      "Next": "CheckIngest"
+    },
+    "CheckIngest": {
+      "Type": "Choice",
+      "Choices": [ { "Variable": "$.ingest.status", "StringEquals": "partial", "Next": "NotifyWarning" } ],
+      "Default": "SilverClean"
+    },
+    "NotifyWarning": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:222238779166:wistia-pipeline-alerts",
+        "Subject": "Wistia pipeline WARNING",
+        "Message.$": "States.Format('Wistia pipeline warning: non-critical endpoint(s) failed {}. Silver and Gold still run; the failed endpoint catches up on the next run. Execution: {}', States.JsonToString($.ingest.failed), $$.Execution.Id)"
+      },
+      "ResultPath": null,
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.warning_error", "Next": "SilverClean" } ],
       "Next": "SilverClean"
     },
     "SilverClean": {
