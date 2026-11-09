@@ -20,6 +20,9 @@ VISITORS_PER_PAGE = 50
 # visitors only adds browser info to dim_visitor; media_stats is not used by Silver yet.
 # Critical (metadata, daily_stats, events) failures still fail the run.
 NON_CRITICAL = ("stats", "visitors")
+# Daily stats: re-fetch the last few loaded days on every run, because yesterday may not be
+# final at 6 AM and Wistia can revise recent days. Silver keeps the newest copy of each day.
+DAILY_LOOKBACK_DAYS = 3
 
 
 # ---------- Token ----------
@@ -187,7 +190,9 @@ def run():
         if last_day is None:
             start_date = metadata["created"][:10]
         else:
-            start_date = (date.fromisoformat(last_day) + timedelta(days=1)).isoformat()
+            # Lookback: start a few days BEFORE the watermark (never before the video was created)
+            lookback_start = date.fromisoformat(last_day) - timedelta(days=DAILY_LOOKBACK_DAYS - 1)
+            start_date = max(lookback_start.isoformat(), metadata["created"][:10])
         log.info(f"{media_id} daily range {start_date} -> {end_date}")
 
         if start_date > end_date:
