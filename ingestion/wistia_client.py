@@ -19,7 +19,9 @@ VISITORS_PER_PAGE = 50
 # Non-critical endpoints: if only these fail, the run returns "partial" and Silver/Gold still run.
 # visitors only adds browser info to dim_visitor; media_stats is not used by Silver yet.
 # Critical (metadata, daily_stats, events) failures still fail the run.
-NON_CRITICAL = ("stats", "visitors")
+# "_incomplete" = the page cap was reached before the watermark: the rows read are saved,
+# but the watermark is NOT moved, so no record is skipped (warning only).
+NON_CRITICAL = ("stats", "visitors", "events_incomplete", "visitors_incomplete")
 # Daily stats: re-fetch the last few loaded days on every run, because yesterday may not be
 # final at 6 AM and Wistia can revise recent days. Silver keeps the newest copy of each day.
 DAILY_LOOKBACK_DAYS = 3
@@ -90,7 +92,7 @@ def get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, sin
         rows = get_visitors_page(token, page, per_page)
         if rows is None:
             log.error(f"visitors paging failed on page {page}")
-            return None
+            return None, False
         if not rows:
             break
         for visitor in rows:
@@ -100,7 +102,10 @@ def get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, sin
             all_visitors.append(visitor)
         log.info(f"visitors page {page}: {len(rows)} rows")
         page += 1
-    return all_visitors
+    complete = stop or page <= max_pages      # reached the watermark or the end of the list
+    if not complete:
+        log.warning(f"visitors: page cap {max_pages} reached before the watermark - partial read")
+    return all_visitors, complete
 
 
 # ---------- 5. Events (paginated) ----------
@@ -118,7 +123,7 @@ def get_all_events(token, media_id, per_page=100, max_pages=MAX_PAGES, since=Non
         rows = get_events_page(token, media_id, page, per_page)
         if rows is None:
             log.error(f"events paging failed on page {page}")
-            return None
+            return None, False
         if not rows:
             break
         for event in rows:
@@ -128,7 +133,10 @@ def get_all_events(token, media_id, per_page=100, max_pages=MAX_PAGES, since=Non
             all_events.append(event)
         log.info(f"events page {page}: {len(rows)} rows")
         page += 1
-    return all_events
+    complete = stop or page <= max_pages      # reached the watermark or the end of the list
+    if not complete:
+        log.warning(f"events: page cap {max_pages} reached before the watermark - partial read")
+    return all_events, complete
 
 
 # ---------- Save to S3 Bronze ----------
@@ -210,26 +218,36 @@ def run():
         ev_key = f"events#{media_id}"
         last_event = get_watermark(ev_key)
         log.info(f"{media_id} events since: {last_event}")
-        events = get_all_events(token, media_id, per_page=100, max_pages=MAX_PAGES, since=last_event)
+        events, complete = get_all_events(token, media_id, per_page=100, max_pages=MAX_PAGES, since=last_event)
         if events is None:
             log.error(f"{media_id} events failed, bookmark not moved")
             failures.append(f"{media_id} events")
         else:
             if events:
                 save_to_bronze(events, "events", load_date, f"{media_id}_{run_id}")
-                set_watermark(ev_key, events[0]["received_at"])
+                if complete:
+                    set_watermark(ev_key, events[0]["received_at"])
+                else:
+                    # Older events between the watermark and this read were not reached:
+                    # keep the bookmark so nothing is skipped (Silver dedups the overlap)
+                    log.warning(f"{media_id} events incomplete, bookmark not moved")
+                    failures.append(f"{media_id} events_incomplete")
             log.info(f"{media_id} new events: {len(events)}")
 
     last_visitor = get_watermark("visitors")
     log.info(f"visitors since: {last_visitor}")
-    visitors = get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, since=last_visitor)
+    visitors, complete = get_all_visitors(token, per_page=VISITORS_PER_PAGE, max_pages=MAX_PAGES, since=last_visitor)
     if visitors is None:
         log.error("visitors failed, bookmark not moved")
         failures.append("visitors")
     else:
         if visitors:
             save_to_bronze(visitors, "visitors", load_date, f"visitors_{run_id}")
-            set_watermark("visitors", visitors[0]["last_active_at"])
+            if complete:
+                set_watermark("visitors", visitors[0]["last_active_at"])
+            else:
+                log.warning("visitors incomplete, bookmark not moved")
+                failures.append("visitors_incomplete")
         log.info(f"new visitors: {len(visitors)}")
 
     critical = [f for f in failures if f.split(" ")[-1] not in NON_CRITICAL]   # e.g. "8hunphufxp stats" -> "stats"
